@@ -24,6 +24,6 @@ target_include_directories(solver-fuzzy PRIVATE ${GLIB_INCLUDE_DIRS})
 target_link_libraries(solver-smt ${GLIB_LDFLAGS})
 target_link_libraries(solver-fuzzy ${GLIB_LDFLAGS})
 
-set(CMAKE_CXX_FLAGS "-Wall -Wextra -O3 -g")
+set(CMAKE_CXX_FLAGS "-Wall -Wextra -O3 -g -gdwarf-4")
 #set(CMAKE_CXX_FLAGS_DEBUG "-g")
 #set(CMAKE_CXX_FLAGS_RELEASE "-O3")
