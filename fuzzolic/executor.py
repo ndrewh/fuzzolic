@@ -20,6 +20,10 @@ import resource
 import minimizer_qsym
 import minimizer
 
+from multiprocessing.pool import ThreadPool
+import multiprocessing
+from threading import Thread
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SOLVER_SMT_BIN = SCRIPT_DIR + '/../solver/solver-smt'
 SOLVER_FUZZY_BIN = SCRIPT_DIR + '/../solver/solver-fuzzy'
@@ -31,11 +35,11 @@ else:
     AFL_PATH = os.environ['AFL_PATH']
 
 SOLVER_WAIT_TIME_AT_STARTUP = 0.0010
-SOLVER_TIMEOUT = 1000
+SOLVER_TIMEOUT = 1000 # ahaberla: this is not the solver timeout!!!
 SHUTDOWN = False
 
 RUNNING_PROCESSES = []
-MAX_VIRTUAL_MEMORY = 16 * 1024 * 1024 * 1024 # 16 GB
+MAX_VIRTUAL_MEMORY = 32 * 1024 * 1024 * 1024 # 32 GB
 
 def setlimits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -53,11 +57,14 @@ class Executor(object):
                  use_smt_if_empty=False,
                  use_symbolic_models=False,
                  keep_run_dirs=False,
-                 single_path=False):
+                 single_path=False,
+                 nthread=1):
 
         if not os.path.exists(binary):
             sys.exit('ERROR: invalid binary')
         self.binary = os.path.abspath(binary)
+        self.nthread = nthread
+        self.lock = multiprocessing.Lock()
 
         self.binary_args = binary_args
         self.testcase_from_stdin = '@@' not in self.binary_args
@@ -214,7 +221,8 @@ class Executor(object):
         global RUNNING_PROCESSES
         self.__check_shutdown_flag()
 
-        run_dir, run_id = self.__get_run_dir()
+        with self.lock:
+            run_dir, run_id = self.__get_run_dir()
 
         os.system("cp " + testcase + " " + run_dir)
         #testcase = run_dir + "/" + os.path.basename(testcase)
@@ -518,19 +526,20 @@ class Executor(object):
                 # print("File extensions: %s" % file_extension)
             r = self.minimizer.check_testcases(run_dir, global_bitmap_pre_run, f_ext=file_extension)
             k = 0
-            for t in r:
-                good = r[t]
-                if good:
-                    if self.afl:
-                        target = os.path.basename(target)[:len("id:......")]
-                        name = "id:%06d,src:%s" % (self.tick(), target)
-                        self.__import_test_case(run_dir + '/' + t, name)
+            with self.lock:
+                for t in r:
+                    good = r[t]
+                    if good:
+                        if self.afl:
+                            target = os.path.basename(target)[:len("id:......")]
+                            name = "id:%06d,src:%s" % (self.tick(), target)
+                            self.__import_test_case(run_dir + '/' + t, name)
+                        else:
+                            self.__import_test_case(run_dir + '/' + t, 'test_case_%03d_%03d.dat' % (run_id, k))
+                        k += 1
                     else:
-                        self.__import_test_case(run_dir + '/' + t, 'test_case_%03d_%03d.dat' % (run_id, k))
-                    k += 1
-                else:
-                    if self.afl:
-                        os.unlink(run_dir + '/' + t)
+                        if self.afl:
+                            os.unlink(run_dir + '/' + t)
 
         if not self.keep_run_dirs:
             shutil.rmtree(run_dir)
@@ -584,14 +593,13 @@ class Executor(object):
                   self.__get_testcases_dir() + '/' + name)
         return self.__get_queue_dir() + '/' + name
 
-    @property
-    def cur_input(self):
+    def cur_input(self, counter):
         if self.input_fixed_name:
             return self.__get_root_dir() + '/' + self.input_fixed_name
         else:
-            return self.__get_root_dir() + '/.cur_input'
+            return self.__get_root_dir() + f'/.cur_input_{counter}'
 
-    def __pick_testcase(self, initial_run=False, force_smt=False):
+    def __pick_testcase(self, initial_run=False, force_smt=False, input_id=0):
 
         if self.afl:
             queued_inputs = self.__import_from_afl(force_smt)
@@ -630,15 +638,15 @@ class Executor(object):
 
             if force_smt:
                 self.afl_alt_processed_testcases.add(queued_inputs[0])
-            shutil.copy2(queued_inputs[0], self.cur_input)
+            shutil.copy2(queued_inputs[0], self.cur_input(input_id))
             self.afl_processed_testcases.add(queued_inputs[0])
 
             # if initial_run:
             # update bitmap
             self.minimizer.check_testcase(
-                self.cur_input, self.global_bitmap, True)
+                self.cur_input(input_id), self.global_bitmap, True)
 
-            return self.cur_input, os.path.basename(queued_inputs[0]), force_smt
+            return self.cur_input(input_id), os.path.basename(queued_inputs[0]), force_smt
 
         else:
             queued_inputs = list(
@@ -674,12 +682,12 @@ class Executor(object):
                 # sort the queue
                 queued_inputs.sort(key=lambda x: os.path.getmtime(x))
 
-            shutil.copy2(queued_inputs[0], self.cur_input)
+            shutil.copy2(queued_inputs[0], self.cur_input(input_id))
 
             # remove from the queue
             os.unlink(queued_inputs[0])
 
-            return self.cur_input, os.path.basename(queued_inputs[0]), False
+            return self.cur_input(input_id), os.path.basename(queued_inputs[0]), False
 
     def __check_shutdown_flag(self):
         if SHUTDOWN:
@@ -706,22 +714,50 @@ class Executor(object):
                           minimizer_qsym.testcase_compare),
                       reverse=True)
 
-    def run(self):
-
-        self.__check_shutdown_flag()
-        testcase, target, force_smt = self.__pick_testcase(True)
-        while testcase:
+    def runner_thread(self, queue, tid):
+        while True:
+            testcase, target = queue.get()
+            print(f"Thread {tid}: process {testcase}")
             start = time.time()
-            self.fuzz_one(testcase, target)
+            try:
+                self.fuzz_one(testcase, target)
+            except Exception as e:
+                print(f"fuzz_one threw {e}")
+                pass
+
             end = time.time()
             print("Run took %s secs" % round(end-start, 1))
+
+    def run(self):
+        q = multiprocessing.Queue(1)
+
+        # start runners
+        threads = []
+        for tid in range(self.nthread):
+            thread = Thread(target=Executor.runner_thread, args=(self, q, tid))
+            thread.start()
+            threads.append(thread)
+
+
+        self.__check_shutdown_flag()
+        testcase, target, force_smt = self.__pick_testcase(True, input_id=0)
+        input_id = 1
+        while testcase:
+            q.put((testcase, target))
+            print(f"put {input_id}")
+
             if self.debug or self.fuzz_expr or self.single_path:
                 return
+
             self.__check_shutdown_flag()
-            testcase, target, force_smt = self.__pick_testcase()
+            testcase, target, force_smt = self.__pick_testcase(input_id=input_id)
             self.__check_shutdown_flag()
 
+            input_id += 1
+
         print("[FUZZOLIC] no more testcase. Finishing.\n")
+        for t in threads:
+            t.join()
 
         if len(self.__warning_log):
             print()
