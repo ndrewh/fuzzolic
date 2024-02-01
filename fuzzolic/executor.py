@@ -35,7 +35,7 @@ else:
     AFL_PATH = os.environ['AFL_PATH']
 
 SOLVER_WAIT_TIME_AT_STARTUP = 0.0010
-SOLVER_TIMEOUT = 1000 # ahaberla: this is not the solver timeout!!!
+SOLVER_TIMEOUT = 1000 # ahaberla: this is NOT the solver timeout!!! it is passed in on cmdline
 SHUTDOWN = False
 
 RUNNING_PROCESSES = []
