@@ -507,6 +507,64 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
 #endif
 }
 
+static inline void dump_full_path()
+{
+    GHashTableIter iter, iter2;
+    gpointer       key, value;
+    gboolean       res;
+
+    Z3_ast *assertions = calloc(0x100, sizeof(Z3_ast));
+    int assertions_cap = 0x100;
+    int num_assertions = 0;
+
+    GHashTable* added_exprs = f_hash_table_new(NULL, NULL);
+    for (int i=0; i<MAX_INPUT_SIZE*2; i++) {
+        Dependency* dep       = dependency_graph[i];
+
+        // printf("Input: %lu\n", input_idx);
+
+        if (!dep) {
+            continue;
+        }
+        g_hash_table_iter_init(&iter2, dep->exprs);
+        while (g_hash_table_iter_next(&iter2, &key, &value)) {
+            // ToDo: can we remove this check?
+            if (g_hash_table_contains(added_exprs, key) != TRUE) {
+                g_hash_table_add(added_exprs, key);
+                size_t query_dep_idx = (size_t)key;
+                assert(z3_ast_exprs[query_dep_idx]);
+                assertions[num_assertions++] = z3_ast_exprs[query_dep_idx];
+                if (num_assertions == assertions_cap) {
+                    assertions = realloc(assertions, 2 * assertions_cap * sizeof(Z3_ast));
+                    assertions_cap = 2 * assertions_cap;
+                }
+            }
+        }
+    }
+
+    Z3_ast fml = Z3_mk_true(smt_solver.ctx);
+
+    const char *formula_str = Z3_benchmark_to_smtlib_string(smt_solver.ctx,
+                           "", "", "unknown", "",
+                           num_assertions,
+                           assertions,
+                           fml);
+
+    free(assertions);
+
+    char *dump_folder = (char*)getenv("FUZZOLIC_DUMP_DIR");
+    if (!dump_folder)
+        dump_folder = ".";
+
+    dump_folder = strdup(dump_folder);
+    strcat(dump_folder, "/final_out.smt");
+    FILE *fout = fopen(dump_folder, "w");
+    fwrite(formula_str, 1, strlen(formula_str), fout);
+    fclose(fout);
+
+    free(dump_folder);
+    f_hash_table_destroy(added_exprs);
+}
 static inline void add_deps_to_solver(GHashTable* inputs, Z3_solver solver, int skip_expr)
 {
     GHashTableIter iter, iter2;
@@ -5441,6 +5499,7 @@ static void smt_branch_query(Query* q)
             is_interesting = 0;
 #endif
 
+        is_interesting = 0;
         if (is_interesting) {
 
             printf("\nBranch at 0x%lx (id=%lu, taken=%u)\n", q->address,
@@ -5802,6 +5861,7 @@ static int fuzz_query_eval_old(GHashTable* inputs, Z3_ast expr,
 static int smt_all_solutions(GHashTable* inputs, Z3_ast z3_query,
                            GHashTable* solutions, uintptr_t solution)
 {
+    return 0;
     int       count    = 0;
     Z3_solver solver   = smt_new_solver();
     add_deps_to_solver(inputs, solver, -1);
@@ -7422,6 +7482,8 @@ int main(int argc, char* argv[])
         } else {
             if (next_query[0].query == FINAL_QUERY) {
                 SAYF("\n\nReached final query. Exiting...\n");
+                dump_full_path();
+
 
                 printf("Translation time: %lu usecs\n",
                        smt_solver.translation_time);
