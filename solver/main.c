@@ -507,7 +507,7 @@ static inline void update_and_add_deps_to_solver(GHashTable* inputs,
 #endif
 }
 
-static inline void dump_full_path()
+static inline void dump_full_path(Z3_ast extra_assertion, char *fname, int optimistic)
 {
     GHashTableIter iter, iter2;
     gpointer       key, value;
@@ -518,37 +518,42 @@ static inline void dump_full_path()
     int num_assertions = 0;
 
     GHashTable* added_exprs = f_hash_table_new(NULL, NULL);
-    for (int i=0; i<MAX_INPUT_SIZE*2; i++) {
-        Dependency* dep       = dependency_graph[i];
 
-        // printf("Input: %lu\n", input_idx);
+    if (!optimistic) {
+        for (int i=0; i<MAX_INPUT_SIZE*2; i++) {
+            Dependency* dep       = dependency_graph[i];
 
-        if (!dep) {
-            continue;
-        }
-        g_hash_table_iter_init(&iter2, dep->exprs);
-        while (g_hash_table_iter_next(&iter2, &key, &value)) {
-            // ToDo: can we remove this check?
-            if (g_hash_table_contains(added_exprs, key) != TRUE) {
-                g_hash_table_add(added_exprs, key);
-                size_t query_dep_idx = (size_t)key;
-                assert(z3_ast_exprs[query_dep_idx]);
-                assertions[num_assertions++] = z3_ast_exprs[query_dep_idx];
-                if (num_assertions == assertions_cap) {
-                    assertions = realloc(assertions, 2 * assertions_cap * sizeof(Z3_ast));
-                    assertions_cap = 2 * assertions_cap;
+            // printf("Input: %lu\n", input_idx);
+
+            if (!dep) {
+                continue;
+            }
+            g_hash_table_iter_init(&iter2, dep->exprs);
+            while (g_hash_table_iter_next(&iter2, &key, &value)) {
+                // ToDo: can we remove this check?
+                if (g_hash_table_contains(added_exprs, key) != TRUE) {
+                    g_hash_table_add(added_exprs, key);
+                    size_t query_dep_idx = (size_t)key;
+                    assert(z3_ast_exprs[query_dep_idx]);
+                    assertions[num_assertions++] = z3_ast_exprs[query_dep_idx];
+                    if (num_assertions == assertions_cap) {
+                        assertions = realloc(assertions, 2 * assertions_cap * sizeof(Z3_ast));
+                        assertions_cap = 2 * assertions_cap;
+                    }
                 }
             }
         }
     }
 
-    Z3_ast fml = Z3_mk_true(smt_solver.ctx);
+    Z3_ast extra = Z3_mk_true(smt_solver.ctx);
+    if (extra_assertion)
+        extra = extra_assertion;
 
     const char *formula_str = Z3_benchmark_to_smtlib_string(smt_solver.ctx,
                            "", "", "unknown", "",
                            num_assertions,
                            assertions,
-                           fml);
+                           extra);
 
     free(assertions);
 
@@ -556,13 +561,19 @@ static inline void dump_full_path()
     if (!dump_folder)
         dump_folder = ".";
 
-    dump_folder = strdup(dump_folder);
-    strcat(dump_folder, "/final_out.smt");
-    FILE *fout = fopen(dump_folder, "w");
-    fwrite(formula_str, 1, strlen(formula_str), fout);
-    fclose(fout);
+    char *dump_path = malloc(strlen(dump_folder) + strlen(fname) + 0x10);
+    strcpy(dump_path, dump_folder);
+    strcat(dump_path, "/");
+    strcat(dump_path, fname);
+    FILE *fout = fopen(dump_path, "w");
+    if (fout) {
+        fwrite(formula_str, 1, strlen(formula_str), fout);
+        fclose(fout);
+    } else {
+        fprintf(stderr, "Bad dump path\n");
+    }
 
-    free(dump_folder);
+    free(dump_path);
     f_hash_table_destroy(added_exprs);
 }
 static inline void add_deps_to_solver(GHashTable* inputs, Z3_solver solver, int skip_expr)
@@ -5339,6 +5350,30 @@ static inline int smt_check_z3(Query* q, Z3_ast z3_neg_query, GHashTable* inputs
     return is_sat;
 }
 
+static uint64_t* parse_formula_name(const char *s) {
+  if (!s) return NULL;
+
+  uint64_t *arr = (uint64_t*)malloc(3 * sizeof(uint64_t));
+  memset(arr, 0, 3 * sizeof(uint64_t));
+
+  char *s2 = strdup(s);
+  char* pch = strtok (s2,"-");
+  int idx = 0;
+  while (pch != NULL && idx < 4)
+  {
+    if (idx > 0) {
+      uint64_t val = strtoull(pch, NULL, 16);
+      arr[idx-1] = val;
+    }
+    pch = strtok (NULL, "-");
+    idx++;
+  }
+
+  free(s2);
+  return arr;
+}
+
+
 static void smt_branch_query(Query* q)
 {
 #if 0
@@ -5367,9 +5402,6 @@ static void smt_branch_query(Query* q)
 #if 0
     debug_translation = 0;
 #endif
-    if (!inputs) {
-        return;
-    }
 
 #if 0
     Z3_ast z3_query_2 = Z3_simplify(smt_solver.ctx, z3_query);
@@ -5402,6 +5434,68 @@ static void smt_branch_query(Query* q)
         printf("Pattern is INVALID\n");
     }
 #endif
+
+    /* Random branchflipping */
+    if (!q->args8.arg1 && q->args8.arg2) { // if app code (!lib_code) and real_branch
+        static GHashTable *eval_dumped_branches = NULL;
+        if (eval_dumped_branches == NULL)
+            eval_dumped_branches = g_hash_table_new(NULL, NULL);
+
+        static GHashTable *eval_branch_count = NULL;
+        if (eval_branch_count == NULL)
+            eval_branch_count = g_hash_table_new(NULL, NULL);
+
+        gpointer branch_id = (gpointer)(q->address ^ (q->args8.arg0 ? 1 : 0));
+        uintptr_t cur_count = (uintptr_t)g_hash_table_lookup(eval_branch_count, branch_id);
+        g_hash_table_insert(eval_branch_count, branch_id, (gpointer)(cur_count + 1));
+
+        static bool flip_optimistic;
+        static uint64_t *target_branch_info = NULL;
+        static int branchflip_freq = 100;
+        static bool init = false;
+        if (!init) {
+            target_branch_info = parse_formula_name(getenv("EVAL_BRANCH_VERIFY"));
+            flip_optimistic = (getenv("EVAL_BRANCHFLIP_OPTIMISTIC") && getenv("EVAL_BRANCHFLIP_OPTIMISTIC")[0] == '1');
+            init = true;
+            if (getenv("RANDOM_BRANCHFLIP_FREQ")) {
+                branchflip_freq = atoi(getenv("RANDOM_BRANCHFLIP_FREQ"));
+            }
+        }
+        static long counter = 0;
+        counter++;
+
+        if (target_branch_info) {
+          uint64_t target_pc = target_branch_info[0];
+          bool orig_taken = target_branch_info[1] != 0;
+          uint64_t orig_hitcount = target_branch_info[2];
+
+          gpointer target_branch_id = (gpointer)(target_pc ^ (orig_taken ? 1 : 0));
+
+          if (q->address == target_pc && orig_taken != q->args8.arg0 && (uintptr_t)g_hash_table_lookup(eval_branch_count, target_branch_id) == orig_hitcount - 1) {
+              // successful flip
+              printf("flip_success\n");
+              exit(1); // lets get out of here
+          }
+        } else if ((rand() % branchflip_freq) == 0) {
+            // check if (branch, taken) has been dumped before
+            if (!g_hash_table_contains(eval_dumped_branches, branch_id)) {
+                g_hash_table_insert(eval_dumped_branches, branch_id, (gpointer)1);
+
+                // dump
+                char fname[0x100];
+                snprintf(fname, 0x100, "flip-%lx-%x-%lx.smt", q->address, q->args8.arg0, (long)cur_count + 1);
+                dump_full_path(z3_neg_query, fname, flip_optimistic);
+
+                snprintf(fname, 0x100, "preflip-%lx-%x-%lu.smt", q->address, q->args8.arg0, counter);
+                dump_full_path(NULL, fname, false);
+            }
+        }
+    }
+
+    if (!inputs) {
+        return;
+    }
+
 
     uint8_t has_real_inputs = 0;
 
@@ -7482,7 +7576,7 @@ int main(int argc, char* argv[])
         } else {
             if (next_query[0].query == FINAL_QUERY) {
                 SAYF("\n\nReached final query. Exiting...\n");
-                dump_full_path();
+                /* dump_full_path(NULL); */
 
 
                 printf("Translation time: %lu usecs\n",
