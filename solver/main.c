@@ -16,7 +16,7 @@
 #define EXPR_QUEUE_POLLING_TIME_SECS 0
 #define EXPR_QUEUE_POLLING_TIME_NS   5000
 #define SOLVER_TIMEOUT_Z3_MS         10000
-#define SOLVER_TIMEOUT_FUZZY_MS      (1000 * 7)
+#define SOLVER_TIMEOUT_FUZZY_MS      1000
 
 #ifndef USE_FUZZY_SOLVER
 #define USE_FUZZY_SOLVER 0
@@ -245,6 +245,18 @@ void f_hash_table_destroy(GHashTable* hash_table)
 
 #endif
 
+static unsigned int get_solver_timeout() {
+    const char *solver_timeout = getenv("FUZZOLIC_SOLVER_TIMEOUT_MS");
+    if (!solver_timeout) {
+        return SOLVER_TIMEOUT_FUZZY_MS;
+    }
+    unsigned long tm_ms = strtoul(solver_timeout, NULL, 10);
+    if (!tm_ms) {
+        return SOLVER_TIMEOUT_FUZZY_MS;
+    }
+    return (unsigned int)tm_ms;
+}
+
 static void smt_init(void)
 {
     Z3_config cfg  = Z3_mk_config();
@@ -264,9 +276,14 @@ static void smt_init(void)
     z3_opt_cache = f_hash_table_new(NULL, NULL);
 
 #if USE_FUZZY_SOLVER || ADDRESS_REASONING == FUZZ_GD
+
+    static unsigned int solver_timeout = 0;
+    if (!solver_timeout)
+        solver_timeout = get_solver_timeout();
+
     z3fuzz_init(&smt_solver.fuzzy_ctx, smt_solver.ctx,
                 (char*)config.testcase_path, NULL, &conc_query_eval_value,
-                SOLVER_TIMEOUT_FUZZY_MS);
+                solver_timeout);
 #endif
 }
 
@@ -285,7 +302,13 @@ static inline Z3_solver smt_new_solver()
 #if 1
     Z3_symbol timeout = Z3_mk_string_symbol(smt_solver.ctx, "timeout");
     Z3_params params  = Z3_mk_params(smt_solver.ctx);
-    Z3_params_set_uint(smt_solver.ctx, params, timeout, SOLVER_TIMEOUT_Z3_MS);
+
+    static unsigned int solver_timeout = 0;
+    if (!solver_timeout)
+        solver_timeout = get_solver_timeout();
+
+    Z3_params_set_uint(smt_solver.ctx, params, timeout, solver_timeout);
+
     Z3_solver_set_params(smt_solver.ctx, cached_solver, params);
 #endif
     return cached_solver;
