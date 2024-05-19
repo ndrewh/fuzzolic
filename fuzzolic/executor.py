@@ -453,7 +453,7 @@ class Executor(object):
                 print('[FUZZOLIC] Solver is taking to long. Let us stop it.')
                 p_solver.send_signal(signal.SIGUSR2)
                 try:
-                    p_solver.wait(SOLVER_TIMEOUT)
+                    p_solver.wait(SOLVER_TIMEOUT / 1000)
                 except subprocess.TimeoutExpired:
                     print('[FUZZOLIC] Solver will be killed.')
                     p_solver.send_signal(signal.SIGKILL)
